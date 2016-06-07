@@ -36,15 +36,49 @@
 #include <termios.h>
 #include <libutil.h>
 #include <string.h>
-#include <string.h>
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <locale.h>
 
-#include "svncterm.h"
+#include <sys/param.h>
+#include <sys/jail.h>
+
+#include <jail.h>
+
+#include "vncterm.h"
 #include "glyphs.h"
+
+#define	JP_USER		0x01000000
+#define	JP_OPT		0x02000000
+
+#define	PRINT_DEFAULT	0x01
+#define	PRINT_HEADER	0x02
+#define	PRINT_NAMEVAL	0x04
+#define	PRINT_QUOTED	0x08
+#define	PRINT_SKIP	0x10
+#define	PRINT_VERBOSE	0x20
+#define	PRINT_JAIL_NAME	0x40
+
+static struct jailparam *params;
+static int *param_parent;
+static int nparams;
+
+static int add_param(const char *name, void *value, size_t valuelen,
+		struct jailparam *source, unsigned flags);
+static int print_jail(int pflags, int jflags);
+
+int is_number(const char *p);
+int is_numbercmd(int argc, char **argv);
+int isnum = 0;
+int findjid = -1;
+char *findjname = NULL;
+char vncpassword[50];
+int vncport = 0;
+char *listen_str;
+
+#define is_digit(c)	((unsigned int)((c) - '0') <= 9)
 
 /* define this for debugging */
 //#define DEBUG
@@ -53,12 +87,6 @@
 #define TERM "xterm"
 
 #define TERMIDCODE "[?1;2c" // vt100 ID
-
-#define CHECK_ARGC(argc,argv,i) if (i >= argc-1) { \
-   fprintf (stderr, "ERROR: not enough arguments for: %s\n", argv[i]); \
-   print_usage (NULL); \
-   exit(1); \
-}
 
 /* these colours are from linux kernel drivers/char/vt.c */
 
@@ -74,13 +102,6 @@ int default_grn[] = {0x00,0x00,0xaa,0x55,0x00,0x00,0xaa,0xaa,
     0x55,0x55,0xff,0xff,0x55,0x55,0xff,0xff};
 int default_blu[] = {0x00,0x00,0x00,0x00,0xaa,0xaa,0xaa,0xaa,
     0x55,0x55,0x55,0x55,0xff,0xff,0xff,0xff};
-
-static void
-print_usage (const char *msg)
-{
-  if (msg) { fprintf (stderr, "ERROR: %s\n", msg); }
-  fprintf (stderr, "USAGE: vncterm [vncopts] -j jid [-c command [args]]\n");
-}
 
 /* Convert UCS2 to UTF8 sequence, trailing zero */
 static int
@@ -1743,6 +1764,7 @@ vncTerm *
 create_vncterm (int argc, char** argv, int maxx, int maxy)
 {
   int i;
+  int ok;
 
   rfbScreenInfoPtr screen = rfbGetScreen (&argc, argv, maxx, maxy, 8, 1, 1);
   screen->frameBuffer=(char*)calloc(maxx*maxy, 1);
@@ -1766,9 +1788,28 @@ create_vncterm (int argc, char** argv, int maxx, int maxy)
 
   screen->ptrAddEvent = vncterm_pointer_event;
 
-  screen->desktopName = "VNC Command Terminal";
+//  screen->desktopName = "VNC Terminal";
+  screen->desktopName = findjname;
 
   screen->newClientHook = new_client;
+
+    if (strlen(vncpassword)>1) {
+	static const char* passwords[2]={vncpassword,0};
+	screen->authPasswdData=(void*)passwords;
+    }
+
+    if ( vncport != 0 ) screen->port = vncport;
+
+    ok = 1;
+
+    if (listen_str != NULL) {
+		in_addr_t iface = inet_addr(listen_str);
+			screen->listenInterface = iface;
+    }
+
+//    static const char* passwords[2]={"secret",0};
+//    screen->authPasswdData=(void*)passwords;
+//    screen->checkPassword=rfbCheckPasswordByList;
 
   vt->maxx = screen->width;
   vt->maxy = screen->height;
@@ -1833,48 +1874,83 @@ create_vncterm (int argc, char** argv, int maxx, int maxy)
 int
 main (int argc, char** argv)
 {
-  int i;
-//  char **cmdargv = NULL;
-//  char *command = "/bin/csh"; // execute normal shell as default
-  int pid;
-  int master;
-  char ptyname[1024];
-  fd_set fs, fs1;
-  struct timeval tv, tv1;
-  time_t elapsed, cur_time;
-  struct winsize dimensions;
-  char jid[10];
+	int pid;
+	int master;
+	int c;
+	char ptyname[1024];
+	fd_set fs, fs1;
+	struct timeval tv, tv1;
+	time_t elapsed, cur_time;
+	struct winsize dimensions;
+	char *ep;
+	char *command = NULL;
 
-  memset(jid,0,sizeof(jid));
+	int pflags =0;
+	int jflags = 0;
+	int lastjid = 0;
 
-//  for (i = 1; i < argc; i++) {
-//    if (!strcmp (argv[i], "-c")) {
-//      command = argv[i+1];
-//      cmdargv = &argv[i+1];
-//      argc = i;
-//      argv[i] = NULL;
-//      break;
-//    }
-//  }
+	memset(vncpassword,0,sizeof(vncpassword));
 
-  for (i = 1; i < argc; i++) {
-    if (!strcmp (argv[i], "-timeout")) {
-      CHECK_ARGC (argc, argv, i);
-      idle_timeout = atoi(argv[i+1]);
-      rfbPurgeArguments(&argc, &i, 2, argv); i--;
-    }
-  }
+	while ((c = getopt(argc, argv, "a:j:p:s:t:w:")) >= 0)
+		switch (c) {
+			case 'a':
+				listen_str = malloc(strlen(optarg) + 1);
+				memset(listen_str, 0, strlen(optarg) + 1);
+				strcpy(listen_str, optarg);
+				break;
+			case 'j':
+				findjid = strtoul(optarg, &ep, 10);
+				if (!findjid || *ep) {
+					findjid = 0;
+					findjname = optarg;
+					isnum = 0;
+				} else {
+					isnum = 1;
+				}
+				break;
+			case 'p':
+				vncport = atoi(optarg);
+				break;
+			case 's':
+				command = malloc(strlen(optarg) + 1);
+				memset(command, 0, strlen(optarg) + 1);
+				strcpy(command, optarg);
+				break;
+			case 'w':
+				strcpy(vncpassword,optarg);
+				break;
+		}
 
-  for (i = 1; i < argc; i++) {
-    if (!strcmp (argv[i], "-j")) {
-      strcpy(jid,argv[i+1]);
-    }
-  }
+	if ((findjid==-1)&&(!findjname)) {
+		printf("usage: svncterm -j [ jid or jname] [-a listen addr ] [-p port ] [-s command/shell (/bin/csh)] [-t connect timeout] [-w password]\n");
+		return 1;
+	}
 
-  if (strlen(jid)<1) {
-	printf("Give me jid -j\n");
-	exit(1);
-  }
+	if ( command == NULL ) command="/bin/csh";
+
+	/* Add the parameters to print. */
+	add_param("jid", NULL, (size_t)0, NULL, JP_USER);
+	add_param("name", NULL, (size_t)0, NULL, JP_USER);
+	add_param("lastjid", &lastjid, sizeof(lastjid), NULL, 0);
+
+	for (lastjid = 0; (lastjid = print_jail(pflags, jflags)) >= 0; ) {
+	}
+
+	if (isnum==1) {
+		if (!findjname) {
+			printf("Can't find jail\n");
+			exit(1);
+		}
+	} else {
+		if (findjid < 1) {
+			printf("Can't find jail\n");
+			exit(1);
+		}
+	}
+
+	char jid[10];
+	memset(jid,0,sizeof(jid));
+	sprintf(jid,"%d",findjid);
 
 #ifdef DEBUG
   rfbLogEnable (1);
@@ -1906,13 +1982,7 @@ main (int argc, char** argv)
     signal (SIGTERM, SIG_DFL);
     signal (SIGINT, SIG_DFL);
 
-//    if (cmdargv) {
-//      execvp (command, cmdargv);
-//    } else {
-//      execlp (command, command, NULL);
-//    }
-
-    execlp("/usr/sbin/jexec", "/usr/sbin/jexec", jid, "/bin/csh", (char *)NULL);
+    execlp("/usr/sbin/jexec", "/usr/sbin/jexec", jid, command, (char *)NULL);
     perror ("Error: exec failed\n");
     exit (-1); // should not be reached
   } else if (pid == -1) {
@@ -1989,4 +2059,130 @@ main (int argc, char** argv)
   waitpid(pid, &status, 0);
 
   exit (0);
+}
+
+
+static int
+add_param(const char *name, void *value, size_t valuelen,
+	struct jailparam *source, unsigned flags)
+{
+	struct jailparam *param, *tparams;
+	int i, tnparams;
+
+	static int paramlistsize;
+
+	/* The pseudo-parameter "all" scans the list of available parameters. */
+	if (!strcmp(name, "all")) {
+		tnparams = jailparam_all(&tparams);
+		if (tnparams < 0) {
+			printf("error: %s", jail_errmsg);
+			return 1;
+			}
+		for (i = 0; i < tnparams; i++)
+			add_param(tparams[i].jp_name, NULL, (size_t)0,
+			    tparams + i, flags);
+		free(tparams);
+		return -1;
+	}
+
+	/* Check for repeat parameters. */
+	for (i = 0; i < nparams; i++)
+		if (!strcmp(name, params[i].jp_name)) {
+			if (value != NULL && jailparam_import_raw(params + i,
+			    value, valuelen) < 0) {
+				printf("error: %s", jail_errmsg);
+				return 1;
+				}
+			params[i].jp_flags |= flags;
+			if (source != NULL)
+				jailparam_free(source, 1);
+			return i;
+		}
+
+	/* Make sure there is room for the new param record. */
+	if (!nparams) {
+		paramlistsize = 32;
+		params = malloc(paramlistsize * sizeof(*params));
+		param_parent = malloc(paramlistsize * sizeof(*param_parent));
+		if (params == NULL || param_parent == NULL) {
+			printf("malloc");
+			return 1;
+			}
+	} else if (nparams >= paramlistsize) {
+		paramlistsize *= 2;
+		params = realloc(params, paramlistsize * sizeof(*params));
+		param_parent = realloc(param_parent,
+		    paramlistsize * sizeof(*param_parent));
+		if (params == NULL || param_parent == NULL) {
+			printf("realloc");
+			return 1;
+			}
+	}
+
+	/* Look up the parameter. */
+	param_parent[nparams] = -1;
+	param = params + nparams++;
+	if (source != NULL) {
+		*param = *source;
+		param->jp_flags |= flags;
+		return param - params;
+	}
+	if (jailparam_init(param, name) < 0 ||
+		(value != NULL ? jailparam_import_raw(param, value, valuelen)
+		: jailparam_import(param, value)) < 0) {
+		if (flags & JP_OPT) {
+			nparams--;
+			return (-1);
+		}
+		printf("error: %s", jail_errmsg);
+		return 1;
+	}
+	param->jp_flags = flags;
+	return param - params;
+}
+
+static int
+print_jail(int pflags, int jflags)
+{
+	int jid = 0;
+
+	jid = jailparam_get(params, nparams, jflags);
+
+	if (isnum==1) {
+		if (*(int *) params[0].jp_value == findjid ) {
+			findjname=(char *)params[1].jp_value;
+			jid=-1;
+		}
+	} else {
+		if (!strcmp((char *)params[1].jp_value,findjname)) {
+			findjid=*(int *)params[0].jp_value;
+			jid=-1;
+		}
+	}
+
+	return (jid);
+}
+
+int is_numbercmd(int argc, char **argv)
+{
+	if (argv[1])
+		return is_number(argv[1]);
+	else
+		return 1;
+}
+
+
+int is_number(const char *p)
+{
+	const char *q;
+
+	if (*p == '\0')
+		return 0;
+	while (*p == '0')
+		p++;
+	for (q = p; *q != '\0'; q++)
+		if (! is_digit(*q))
+			return 0;
+	if (q - p > 10000 ) return 0;
+	return 1;
 }
